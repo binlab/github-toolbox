@@ -1,0 +1,119 @@
+name: 🔄 Upstream Sync
+
+on:
+  workflow_call:
+    inputs:
+      upstream_repo:
+        description: "Git Remote repository where should be pull"
+        required: true
+        type: string
+      upstream_branch:
+        description: "Git Remote branch where should be pull"
+        required: false
+        type: string
+        default: "main"
+      target_branch:
+        description: "Git branch in local repository"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      CLIENT_ID:
+        description: "GitHub App ID"
+        required: true
+      APP_PRIVATE_KEY:
+        description: "GitHub App Private Key"
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  sync:
+    name: 📥 Fetch & Mirror
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔑 Generate App Token
+        id: generate-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: 📥 Checkout Target Repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: ⚙️ Configure Git Identity
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+        run: |
+          set -euo pipefail
+
+          echo -e "\e[36m[ACTION] Configuring Git identity based on trigger event: $EVENT_NAME...\e[0m"
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+
+            echo -e "\e[34m[INFO] Pipeline triggered automatically (cron). Using official GitHub Actions Bot.\e[0m"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          else
+            echo -e "\e[34m[INFO] Pipeline triggered manually by user. Using actor: $ACTOR.\e[0m"
+            git config user.name "$ACTOR"
+            git config user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
+          fi
+
+          echo -e "\e[32m[SUCCESS] Git identity configured successfully.\e[0m"
+
+      - name: 🔌 Fetch Upstream
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+        run: |
+          set -euo pipefail
+
+          echo -e "\e[36m[ACTION] Adding upstream remote: https://github.com/$UPSTREAM_REPO.git...\e[0m"
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+
+          echo "::group::Git Fetch Logs"
+
+          echo -e "\e[36m[ACTION] Fetching branch '$UPSTREAM_BRANCH' from upstream...\e[0m"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+          echo -e "\e[36m[ACTION] Fetching tags into 'upstream/' namespace (with prune)...\e[0m"
+          git fetch upstream "+refs/tags/*:refs/tags/upstream/*" --prune
+
+          echo "::endgroup::"
+
+          echo -e "\e[32m[SUCCESS] Upstream data fetched successfully.\e[0m"
+
+      - name: 🔀 Sync Mirror Branch
+        env:
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          echo -e "\e[36m[ACTION] Force syncing local branch '$TARGET_BRANCH' with 'upstream/$UPSTREAM_BRANCH'...\e[0m"
+
+          echo "::group::Git Push Logs"
+          git push origin "upstream/$UPSTREAM_BRANCH:$TARGET_BRANCH" --force
+          echo "::endgroup::"
+
+          echo -e "\e[32m[SUCCESS] Mirror branch synced successfully.\e[0m"
+
+      - name: 🏷️ Sync Tags
+        run: |
+          set -euo pipefail
+
+          echo -e "\e[36m[ACTION] Pushing upstream namespace tags to origin...\e[0m"
+
+          echo "::group::Git Push Tags Logs"
+          git push origin "refs/tags/upstream/*" --force
+          echo "::endgroup::"
+
+          echo -e "\e[32m[SUCCESS] Upstream tags synced successfully.\e[0m"
