@@ -1,0 +1,57 @@
+name: 🔄 Upstream Sync
+
+on:
+  workflow_call:
+    inputs:
+      upstream_repo:
+        description: "Git Remote repository where should be pull"
+        required: true
+        type: string
+      upstream_branch:
+        description: "Git Remote branch where should be pull"
+        required: false
+        type: string
+        default: "main"
+      target_branch:
+        description: "Git branch in local repository"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      PAT_TOKEN:
+        description: "GitHub Token for API access"
+        required: true
+
+jobs:
+  sync:
+    name: 🔄 Sync Branches & Tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Target Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      - name: ⚙️ Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: 🔌 Fetch Upstream
+        run: |
+          git remote add upstream https://github.com/${{ inputs.upstream_repo }}.git
+          git fetch upstream ${{ inputs.upstream_branch }}
+
+          # Fetch all tags but place them in the "upstream/" namespace
+          git fetch upstream "+refs/tags/*:refs/tags/upstream/*"
+
+      - name: 🔀 Sync Mirror Branch
+        run: |
+          # Force update our local main branch to match the upstream branch perfectly
+          git push origin upstream/${{ inputs.upstream_branch }}:${{ inputs.target_branch }} --force
+
+      - name: 🏷️ Sync Tags
+        run: |
+          # Push only the upstream namespace tags to our fork
+          git push origin "refs/tags/upstream/*" --force
