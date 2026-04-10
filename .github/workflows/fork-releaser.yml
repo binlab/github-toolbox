@@ -1,0 +1,155 @@
+name: 🔀 Fork Releaser
+
+on:
+  workflow_call:
+    inputs:
+      force_tag:
+        description: "Force specific upstream tag (e.g. v1.50.0). Leave empty to auto-discover."
+        required: false
+        type: string
+        default: ""
+      overwrite:
+        description: "Force overwrite: Re-run release even if tag already exists."
+        required: false
+        type: boolean
+        default: false
+      features:
+        description: "Space-separated list of feature branches to cherry-pick."
+        required: true
+        type: string
+      stable_branch:
+        description: "Name of the stable baseline branch."
+        required: false
+        type: string
+        default: "stable"
+      fork_branch:
+        description: "Name of the assembled fork branch."
+        required: false
+        type: string
+        default: "fork"
+    secrets:
+      PAT_TOKEN:
+        required: true
+      GPG_PRIVATE_KEY:
+        required: true
+      PASSPHRASE:
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: ⚙️ Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: 🔄 Fetch Local Tags
+        run: |
+          # Fetch all tags including custom namespaces
+          git fetch origin "+refs/tags/*:refs/tags/*"
+
+      - name: 🔍 Resolve Target Tag
+        id: vars
+        run: |
+          if [ -n "${{ inputs.force_tag }}" ]; then
+            TARGET_TAG="${{ inputs.force_tag }}"
+          else
+            # Auto-discover the latest tag from the upstream namespace
+            TARGET_TAG=$(git ls-remote --tags --refs --sort="v:refname" origin "refs/tags/upstream/*" | tail -n1 | sed 's/.*\///')
+          fi
+
+          echo "tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+          echo "Target tag resolved to: $TARGET_TAG"
+
+      - name: 🚦 Check Release Status
+        id: check
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          OVERWRITE="${{ inputs.overwrite }}"
+
+          if [ "$OVERWRITE" = "true" ]; then
+            echo "Emergency mode: Overwrite is enabled. Proceeding with release."
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          else
+            if git ls-remote --tags --exit-code origin refs/tags/$TAG >/dev/null 2>&1; then
+              echo "::warning::Tag $TAG already exists in origin. Skipping to prevent GoReleaser failure."
+              echo "should_release=false" >> $GITHUB_OUTPUT
+            else
+              echo "Tag $TAG is new. Proceeding with release."
+              echo "should_release=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: 🏷️ Advance Stable Branch
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STABLE="${{ inputs.stable_branch }}"
+
+          OLD_BASE=$(git rev-parse origin/$STABLE 2>/dev/null || echo "none")
+          if [ "$OLD_BASE" = "none" ]; then
+            echo "::warning::Branch origin/$STABLE not found. Initializing a new one."
+          fi
+          echo "old_base=$OLD_BASE" >> $GITHUB_ENV
+
+          # Reset the stable branch to the target upstream tag
+          git checkout -B $STABLE refs/tags/upstream/$TAG
+          git push origin $STABLE --force
+
+      - name: 🛠️ Assemble Fork Branch
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STABLE="${{ inputs.stable_branch }}"
+          FORK="${{ inputs.fork_branch }}"
+
+          # Initialize the fork branch from the clean stable baseline
+          git checkout -B $FORK $STABLE
+
+          # Apply all specified feature branches sequentially
+          for FEATURE in ${{ inputs.features }}; do
+            echo "Applying patches from branch: $FEATURE..."
+            git cherry-pick --empty=drop ${{ env.old_base }}..origin/$FEATURE || {
+              echo "::error::Merge conflict while applying $FEATURE. Manual intervention required."
+              exit 1
+            }
+          done
+
+          # Push the assembled branch and the new release tag
+          git push origin $FORK --force
+          git tag -f $TAG
+          git push origin $TAG --force
+
+      - name: 🏗️ Set up Go
+        if: steps.check.outputs.should_release == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: 🔑 Import GPG Key
+        if: steps.check.outputs.should_release == 'true'
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+
+      - name: 🚀 Run GoReleaser
+        if: steps.check.outputs.should_release == 'true'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --timeout 60m0s
+        env:
+          # github.token is a built-in context variable, always available
+          GITHUB_TOKEN: ${{ github.token }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
