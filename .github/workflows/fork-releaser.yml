@@ -1,0 +1,292 @@
+name: 🔀 Fork Releaser
+
+on:
+  workflow_call:
+    inputs:
+      target_tag:
+        description: "Specific upstream tag to release (e.g., v1.50.0). Leave empty to auto-discover the latest."
+        required: false
+        type: string
+        default: ""
+      overwrite:
+        description: "Recreate the release even if the tag already exists in this repository."
+        required: false
+        type: boolean
+        default: false
+      features:
+        description: "Space-separated list of feature branches to cherry-pick."
+        required: true
+        type: string
+      base_branch:
+        description: "Name of the upstream base branch (e.g., main)."
+        required: false
+        type: string
+        default: "main"
+      stable_branch:
+        description: "Name of the stable baseline branch."
+        required: false
+        type: string
+        default: "stable"
+      release_branch:
+        description: "Name of the assembled release branch."
+        required: false
+        type: string
+        default: "release"
+    secrets:
+      CLIENT_ID:
+        description: "GitHub App ID"
+        required: true
+      APP_PRIVATE_KEY:
+        description: "GitHub App Private Key"
+        required: true
+      GPG_PRIVATE_KEY:
+        description: "GPG Private Key"
+        required: true
+      GPG_PASSPHRASE:
+        description: "GPG Private Key Passphrase"
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  release:
+    name: 🍒 Assemble & Tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔑 Generate App Token
+        id: generate-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: ⚙️ Configure Git Identity
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Configuring Git identity based on trigger event: '$EVENT_NAME'...\e[0m"
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            echo -e "\e[34m[INFO] Pipeline triggered automatically (cron). Using official GitHub Actions Bot.\e[0m"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          else
+            echo -e "\e[34m[INFO] Pipeline triggered manually by user. Using actor: '$ACTOR'.\e[0m"
+            git config user.name "$ACTOR"
+            git config user.email "${ACTOR_ID}+${ACTOR}@users.noreply.github.com"
+          fi
+
+          echo -e "\e[32m[SUCCESS] Git identity configured successfully.\e[0m"
+
+      - name: 🔄 Fetch Local Tags
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Fetching all tags including custom namespaces from origin...\e[0m"
+
+          echo "::group::Git Fetch Logs"
+          git fetch origin "+refs/tags/*:refs/tags/*" --prune
+          echo "::endgroup::"
+
+          echo -e "\e[32m[SUCCESS] Tags fetched successfully.\e[0m"
+
+      - name: 🔍 Resolve Target Tag
+        id: vars
+        env:
+          INPUT_TARGET_TAG: ${{ inputs.target_tag || '' }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[34m[INFO] Resolving target tag...\e[0m"
+
+          if [ -n "$INPUT_TARGET_TAG" ]; then
+            TARGET_TAG="$INPUT_TARGET_TAG"
+            echo -e "\e[34m[INFO] Manual override detected. Target tag: '$TARGET_TAG'\e[0m"
+          else
+            echo -e "\e[36m[ACTION] Searching for the latest upstream tag...\e[0m"
+            TARGET_TAG=$(git ls-remote --tags --refs --sort="v:refname" origin "refs/tags/upstream/*" | tail -n1 | sed 's/.*\///' || echo "")
+            
+            if [ -z "$TARGET_TAG" ]; then
+              echo "::error::[ERROR] No upstream tags found to auto-discover!"
+              exit 1
+            fi
+            echo -e "\e[32m[SUCCESS] Auto-discovered target tag: '$TARGET_TAG'\e[0m"
+          fi
+
+          echo "tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+
+      - name: 🚦 Check Release Status
+        id: check
+        env:
+          TARGET_TAG: ${{ steps.vars.outputs.tag }}
+          OVERWRITE_FLAG: ${{ inputs.overwrite == true && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[34m[INFO] Evaluating release conditions for tag: '$TARGET_TAG'\e[0m"
+
+          if [ "$OVERWRITE_FLAG" = "true" ]; then
+            echo "::warning::[WARN] Emergency mode: Overwrite is ENABLED. Proceeding with release regardless of state."
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          else
+            echo -e "\e[36m[ACTION] Checking if tag '$TARGET_TAG' already exists in origin...\e[0m"
+            if git ls-remote --tags --exit-code origin refs/tags/$TARGET_TAG >/dev/null 2>&1; then
+              echo "::warning::[WARN] Tag '$TARGET_TAG' already exists. Skipping assembly to prevent GoReleaser failure."
+              echo "should_release=false" >> $GITHUB_OUTPUT
+            else
+              echo -e "\e[32m[SUCCESS] Tag '$TARGET_TAG' is new. Proceeding with assembly and release.\e[0m"
+              echo "should_release=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: 🏷️ Advance Stable Branch
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          TARGET_TAG: ${{ steps.vars.outputs.tag }}
+          STABLE_BRANCH: ${{ inputs.stable_branch }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Locating previous state of 'origin/$STABLE_BRANCH'...\e[0m"
+
+          OLD_BASE=$(git rev-parse origin/$STABLE_BRANCH 2>/dev/null || true)
+
+          if [ -z "$OLD_BASE" ]; then
+            echo "::warning::[WARN] Branch 'origin/$STABLE_BRANCH' not found. Initializing as a fresh baseline."
+            OLD_BASE="NONE"
+          else
+            echo -e "\e[34m[INFO] Previous base commit resolved to: '$OLD_BASE'\e[0m"
+          fi
+
+          echo "old_base=$OLD_BASE" >> $GITHUB_ENV
+
+          echo -e "\e[36m[ACTION] Resetting local branch '$STABLE_BRANCH' to 'refs/tags/upstream/$TARGET_TAG'...\e[0m"
+          echo -e "\e[36m[ACTION] Force pushing updated stable branch to origin...\e[0m"
+
+          echo "::group::Git Branch Reset & Push Logs"
+          git checkout -B $STABLE_BRANCH refs/tags/upstream/$TARGET_TAG
+          git push origin $STABLE_BRANCH --force
+          echo "::endgroup::"
+
+          echo -e "\e[32m[SUCCESS] Stable branch advanced.\e[0m"
+
+      - name: 🍒 Apply Feature Patches
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          STABLE_BRANCH: ${{ inputs.stable_branch }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          FEATURE_LIST: ${{ inputs.features }}
+        run: |
+          set -euo pipefail
+
+          echo -e "\e[36m[ACTION] Initializing release branch '$RELEASE_BRANCH' from '$STABLE_BRANCH'...\e[0m"
+
+          echo "::group::Git Checkout Logs"
+          git checkout -B $RELEASE_BRANCH $STABLE_BRANCH
+          echo "::endgroup::"
+
+          echo -e "\e[34m[INFO] --- Starting Feature Assembly ---\e[0m"
+
+          if [ "$old_base" = "NONE" ]; then
+             echo "::error::[ERROR] Cannot cherry-pick features because stable branch did not exist previously."
+             exit 1
+          fi
+
+          echo -e "\e[34m[INFO] Upstream active development branch set to: 'origin/$BASE_BRANCH'\e[0m"
+
+          for FEATURE in $FEATURE_LIST; do
+            echo -e "\e[36m[ACTION] Applying patches from branch: 'origin/$FEATURE'\e[0m"
+            
+            if ! git ls-remote --heads origin $FEATURE >/dev/null 2>&1; then
+               echo "::error::[ERROR] Feature branch 'origin/$FEATURE' does not exist! Aborting assembly."
+               exit 1
+            fi
+
+            echo -e "\e[34m[INFO] Extracting commits unique to '$FEATURE' (ignoring 'origin/$BASE_BRANCH')...\e[0m"
+            
+            COMMITS=$(git rev-list --reverse --no-merges origin/$FEATURE --not origin/$BASE_BRANCH origin/$STABLE_BRANCH)
+
+            if [ -z "$COMMITS" ]; then
+              echo "::warning::[WARN] No unique custom commits found in '$FEATURE' (it is identical to 'origin/$BASE_BRANCH')."
+              continue
+            fi
+
+            echo "::group::Cherry-Pick Logs for $FEATURE"
+            for COMMIT in $COMMITS; do
+              echo -e "\e[35m[PROCESS] Cherry-picking commit: '$(git log -1 --format="%h - %s" $COMMIT)'\e[0m"
+              if ! git cherry-pick --empty=drop $COMMIT; then
+                echo "::error::[ERROR] Merge conflict while applying your custom commit '$COMMIT'."
+                echo "::error::[ERROR] Manual intervention required. Your feature patch conflicts with the old stable branch code."
+                git cherry-pick --abort
+                exit 1
+              fi
+            done
+            echo "::endgroup::"
+            
+            echo -e "\e[32m[SUCCESS] Branch '$FEATURE' applied successfully.\e[0m"
+          done
+
+          echo -e "\e[32m[SUCCESS] --- Feature Assembly Complete ---\e[0m"
+
+      - name: 🔖 Publish Release Branch & Tag
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          TARGET_TAG: ${{ steps.vars.outputs.tag }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+        run: |
+          set -euo pipefail
+
+          echo -e "\e[36m[ACTION] Force pushing assembled '$RELEASE_BRANCH' branch to origin...\e[0m"
+          echo "::group::Git Push Release Branch Logs"
+          git push origin $RELEASE_BRANCH --force
+          echo "::endgroup::"
+          echo -e "\e[32m[SUCCESS] Branch '$RELEASE_BRANCH' published.\e[0m"
+
+          echo -e "\e[36m[ACTION] Tagging the assembled state as '$TARGET_TAG'...\e[0m"
+          echo -e "\e[36m[ACTION] Force pushing tag '$TARGET_TAG' to origin...\e[0m"
+          echo "::group::Git Tag & Push Logs"
+          git tag -f $TARGET_TAG
+          git push origin $TARGET_TAG --force
+          echo "::endgroup::"
+          echo -e "\e[32m[SUCCESS] Tag '$TARGET_TAG' published successfully.\e[0m"
+
+      - name: 🏗️ Set up Go
+        if: steps.check.outputs.should_release == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: 📦 Download & Cache Go Modules
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Downloading Go modules...\e[0m"
+          go mod download
+          echo -e "\e[32m[SUCCESS] Modules ready.\e[0m"
+
+      - name: 🔑 Import GPG Key
+        if: steps.check.outputs.should_release == 'true'
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: 🚀 Run GoReleaser
+        if: steps.check.outputs.should_release == 'true'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --parallelism 2 --timeout 60m0s
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
