@@ -280,6 +280,23 @@ jobs:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.GPG_PASSPHRASE }}
 
+      - name: 🔍 Determine Previous Tag for Changelog
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          TARGET_TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo -e "\e[36m[ACTION] Determining previous tag for GoReleaser changelog...\e[0m"
+          PREVIOUS_TAG=$(git tag -l "v*" --sort=-v:refname | sed -n "/^${TARGET_TAG}$/{n;p;}")
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo -e "\e[33m[WARN] No previous tag found. GoReleaser might include the entire history.\e[0m"
+          else
+            echo -e "\e[32m[SUCCESS] Previous tag resolved to: '$PREVIOUS_TAG'\e[0m"
+            echo "GORELEASER_PREVIOUS_TAG=$PREVIOUS_TAG" >> $GITHUB_ENV
+          fi
+
       - name: 🚀 Run GoReleaser
         if: steps.check.outputs.should_release == 'true'
         uses: goreleaser/goreleaser-action@v7
@@ -290,3 +307,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GORELEASER_PREVIOUS_TAG: ${{ env.GORELEASER_PREVIOUS_TAG }}
