@@ -13,6 +13,11 @@ on:
         required: false
         type: boolean
         default: false
+      single_target:
+        description: "Limit the build to a single target architecture (linux/amd64) for faster testing."
+        required: false
+        type: boolean
+        default: false
       features:
         description: "Space-separated list of feature branches to cherry-pick."
         required: true
@@ -296,6 +301,37 @@ jobs:
             echo -e "\e[32m[SUCCESS] Previous tag resolved to: '$PREVIOUS_TAG'\e[0m"
             echo "GORELEASER_PREVIOUS_TAG=$PREVIOUS_TAG" >> $GITHUB_ENV
           fi
+
+      - name: ✂️ Trim matrix for Single Target
+        if: ${{ inputs.single_target == true }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Looking for GoReleaser config file...\e[0m"
+
+          if [ -f ".goreleaser.yml" ]; then
+            GORELEASER_FILE=".goreleaser.yml"
+          elif [ -f ".goreleaser.yaml" ]; then
+            GORELEASER_FILE=".goreleaser.yaml"
+          else
+            echo "::error::[ERROR] Neither .goreleaser.yml nor .goreleaser.yaml found!"
+            exit 1
+          fi
+
+          echo -e "\e[34m[INFO] Patching $GORELEASER_FILE to build ONLY linux/amd64...\e[0m"
+          yq -i '
+            .builds[].goos = ["linux"] | 
+            .builds[].goarch = ["amd64"] | 
+            del(.builds[].ignore)
+          ' $GORELEASER_FILE
+
+          echo "::group::Patched $GORELEASER_FILE"
+          cat $GORELEASER_FILE
+          echo "::endgroup::"
+
+          echo -e "\e[36m[ACTION] Hiding file from Git status...\e[0m"
+          git update-index --assume-unchanged "$GORELEASER_FILE"
+
+          echo -e "\e[32m[SUCCESS] Matrix trimmed and hidden successfully.\e[0m"
 
       - name: 🗑️ Clean Existing GitHub Release
         if: steps.check.outputs.should_release == 'true' && inputs.overwrite == true
