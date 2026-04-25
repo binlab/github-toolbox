@@ -1,0 +1,275 @@
+name: 🧪 Universal Go Tests
+
+on:
+  workflow_call:
+    inputs:
+      go_version_file:
+        description: "Path to go.mod file"
+        required: false
+        type: string
+        default: "go.mod"
+
+      # --- Coverage Analyzers & Reporters ---
+      codecov_enabled:
+        description: "Upload coverage to Codecov (requires token)"
+        required: false
+        type: boolean
+        default: true
+      coveralls_enabled:
+        description: "Upload coverage to Coveralls"
+        required: false
+        type: boolean
+        default: false
+      octocov_enabled:
+        description: "Post PR coverage comment using Octocov"
+        required: false
+        type: boolean
+        default: false
+      octocov_acceptable_threshold:
+        description: "Acceptable coverage threshold for Octocov (e.g., 60%)"
+        required: false
+        type: string
+        default: "60%"
+      gocover_enabled:
+        description: "Post PR coverage comment using standard go tool cover"
+        required: false
+        type: boolean
+        default: false
+
+      # --- Infrastructure Flags ---
+      tf_acc_enabled:
+        description: "Enable Terraform Acceptance Tests (TF_ACC=1)"
+        required: false
+        type: boolean
+        default: true
+      test_matrix:
+        description: 'JSON array. Example: [{"terraform": "1.5.0"}, {"opentofu": "1.6.0"}]'
+        required: false
+        type: string
+        default: '[{"terraform": "latest"}]'
+
+      # --- Test Execution ---
+      pre_test_script:
+        description: "Custom bash commands to run BEFORE build and tests"
+        required: false
+        type: string
+        default: ""
+      test_args:
+        description: "Base arguments for go test (coverage flags injected automatically)"
+        required: false
+        type: string
+        default: "-v ./..."
+
+    secrets:
+      CLIENT_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+      CODECOV_TOKEN:
+        required: false
+
+jobs:
+  test:
+    name: >-
+      ${{ 
+        matrix.target.terraform && format('🧪 Terraform v{0}', matrix.target.terraform) || 
+        matrix.target.opentofu && format('🧪 OpenTofu v{0}', matrix.target.opentofu) || 
+        '🧪 Go Tests' 
+      }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.test_matrix) }}
+
+    steps:
+      - name: 🔑 Generate App Token
+        id: generate-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: 🏗️ Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.go_version_file }}
+          check-latest: true
+          cache: true
+
+      - name: 📦 Download Modules
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Downloading Go modules...\e[0m"
+          go mod download
+          echo -e "\e[32m[SUCCESS] Modules downloaded.\e[0m"
+
+      - name: 🔧 Run Pre-Test Script
+        if: ${{ inputs.pre_test_script != '' }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Running custom pre-test commands...\e[0m"
+          ${{ inputs.pre_test_script }}
+          echo -e "\e[32m[SUCCESS] Pre-test script completed.\e[0m"
+
+      - name: 🔨 Build Check
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Verifying build for all packages...\e[0m"
+          go build -v ./...
+          echo -e "\e[32m[SUCCESS] Build check passed.\e[0m"
+
+      - name: 🌍 Install Terraform
+        if: ${{ matrix.target.terraform != null }}
+        id: tf-install
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ matrix.target.terraform }}
+          terraform_wrapper: false
+
+      - name: 🧊 Install OpenTofu
+        if: ${{ matrix.target.opentofu != null }}
+        id: tofu-install
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ matrix.target.opentofu }}
+          tofu_wrapper: false
+
+      - name: 📝 Report Actual Versions
+        run: |
+          echo "### 🧪 Test Environment" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.tf-install.outputs.terraform_version }}" != "" ]; then
+            echo "- **Terraform Version:** \`${{ steps.tf-install.outputs.terraform_version }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ steps.tofu-install.outputs.tofu_version }}" != "" ]; then
+            echo "- **OpenTofu Version:** \`${{ steps.tofu-install.outputs.tofu_version }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "- **Go Version:** \`$(go env GOVERSION)\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: ⚙️ Setup Acceptance Test Env
+        if: ${{ inputs.tf_acc_enabled == true }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Configuring Acceptance Test Environment...\e[0m"
+
+          echo "TF_ACC=1" >> $GITHUB_ENV
+
+          if [ -n "${{ matrix.target.terraform }}" ]; then
+            echo "TF_ACC_TERRAFORM_PATH=$(which terraform)" >> $GITHUB_ENV
+            echo -e "\e[34m[INFO] TF_ACC_TERRAFORM_PATH set to: $(which terraform)\e[0m"
+          elif [ -n "${{ matrix.target.opentofu }}" ]; then
+            echo "TF_ACC_TERRAFORM_PATH=$(which tofu)" >> $GITHUB_ENV
+            echo -e "\e[34m[INFO] TF_ACC_TERRAFORM_PATH set to: $(which tofu)\e[0m"
+          fi
+
+      - name: 🧪 Execute Go Tests
+        env:
+          TF_LOG: "debug"
+        run: |
+          set -euo pipefail
+
+          ARGS="${{ inputs.test_args }}"
+
+          # Inject coverage flags if any reporter is enabled
+          if [ "${{ inputs.codecov_enabled }}" == "true" ] || \
+             [ "${{ inputs.coveralls_enabled }}" == "true" ] || \
+             [ "${{ inputs.octocov_enabled }}" == "true" ] || \
+             [ "${{ inputs.gocover_enabled }}" == "true" ]; then
+            echo -e "\e[34m[INFO] Coverage reporters enabled. Injecting flags...\e[0m"
+            ARGS="$ARGS -coverprofile=coverage.txt -covermode=atomic"
+          fi
+
+          echo -e "\e[36m[ACTION] Running tests with command: go test $ARGS\e[0m"
+
+          if go test $ARGS; then
+            echo -e "\e[32m[SUCCESS] All tests passed!\e[0m"
+          else
+            echo "::error::[ERROR] Tests failed!"
+            exit 1
+          fi
+
+      # --- REPORTS UPLOAD BLOCK ---
+
+      - name: ☂️ Upload to Codecov
+        if: ${{ inputs.codecov_enabled == true && secrets.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.txt
+          fail_ci_if_error: false
+
+      - name: 📈 Upload to Coveralls
+        if: ${{ inputs.coveralls_enabled == true }}
+        uses: coverallsapp/github-action@v2
+        with:
+          file: ./coverage.txt
+          fail-on-error: false
+
+      # --- PULL REQUEST COMMENTS BLOCK ---
+
+      - name: ⚙️ Setup Octocov Config
+        if: ${{ github.event_name == 'pull_request' && inputs.octocov_enabled == true }}
+        run: |
+          set -euo pipefail
+          if [ -f .octocov.yml ]; then
+            echo -e "\e[34m[INFO] Existing .octocov.yml found. Skipping generation.\e[0m"
+          else
+            echo -e "\e[36m[ACTION] Generating shared .octocov.yml config...\e[0m"
+            cat << 'EOF' > .octocov.yml
+          coverage:
+            paths:
+              - coverage.txt
+            acceptable: ${{ inputs.octocov_acceptable_threshold }}
+          codeToTestRatio:
+            code:
+              - '**/*.go'
+              - '!**/*_test.go'
+            test:
+              - '**/*_test.go'
+          comment:
+            if: is_pull_request
+            hideFooterLink: true
+          EOF
+            echo -e "\e[32m[SUCCESS] .octocov.yml generated.\e[0m"
+          fi
+
+      - name: 🐙 Post Octocov PR Comment
+        if: ${{ github.event_name == 'pull_request' && inputs.octocov_enabled == true }}
+        uses: k1LoW/octocov-action@v1
+
+      - name: 🧮 Calculate GoCover Summary
+        if: ${{ github.event_name == 'pull_request' && inputs.gocover_enabled == true }}
+        id: coverage_summary
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Generating standard Markdown Report...\e[0m"
+
+          go tool cover -func=coverage.txt > coverage_summary.txt
+          TOTAL=$(grep total coverage_summary.txt | grep -Eo '[0-9]+\.[0-9]+')
+
+          echo "### 📊 Go Test Coverage: $TOTAL%" > pr_comment.md
+          echo "<details><summary>Click to view detailed coverage per function</summary>" >> pr_comment.md
+          echo "" >> pr_comment.md
+          echo "\`\`\`text" >> pr_comment.md
+          cat coverage_summary.txt >> pr_comment.md
+          echo "\`\`\`" >> pr_comment.md
+          echo "</details>" >> pr_comment.md
+
+          echo -e "\e[32m[SUCCESS] Report prepared.\e[0m"
+
+      - name: 💬 Post GoCover PR Comment
+        if: ${{ github.event_name == 'pull_request' && inputs.gocover_enabled == true }}
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+          header: coverage-report
+          path: pr_comment.md
