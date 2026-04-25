@@ -133,7 +133,7 @@ jobs:
           echo -e "\e[34m[INFO] Evaluating release conditions for tag: '$TARGET_TAG'\e[0m"
 
           if [ "$OVERWRITE_FLAG" = "true" ]; then
-            echo "::warning::[WARN] Emergency mode: Overwrite is ENABLED. Proceeding with release regardless of state."
+            echo "::warning::[WARN] Overwrite is ENABLED. Proceeding with release regardless of state."
             echo "should_release=true" >> $GITHUB_OUTPUT
           else
             echo -e "\e[36m[ACTION] Checking if tag '$TARGET_TAG' already exists in origin...\e[0m"
@@ -295,6 +295,23 @@ jobs:
           else
             echo -e "\e[32m[SUCCESS] Previous tag resolved to: '$PREVIOUS_TAG'\e[0m"
             echo "GORELEASER_PREVIOUS_TAG=$PREVIOUS_TAG" >> $GITHUB_ENV
+          fi
+
+      - name: 🗑️ Clean Existing GitHub Release
+        if: steps.check.outputs.should_release == 'true' && inputs.overwrite == true
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+          TARGET_TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Overwrite enabled. Checking for existing GitHub Release '$TARGET_TAG'...\e[0m"
+
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            echo -e "::warning::[WARN] Overwrite is ENABLED. Deleting existing release...\e[0m"
+            gh release delete "$TARGET_TAG" --yes
+            echo -e "\e[32m[SUCCESS] Old release deleted.\e[0m"
+          else
+            echo -e "\e[34m[INFO] No existing GitHub Release found. Nothing to clean.\e[0m"
           fi
 
       - name: 🚀 Run GoReleaser
