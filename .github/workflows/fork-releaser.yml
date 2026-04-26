@@ -37,6 +37,21 @@ on:
         required: false
         type: string
         default: "release"
+      wait_for_tests:
+        description: "Wait for the test pipeline to pass before tagging and releasing."
+        required: false
+        type: boolean
+        default: false
+      test_workflow_name:
+        description: "Name of the test workflow file (e.g., tests.yml) to wait for."
+        required: false
+        type: string
+        default: "tests.yml"
+      go_version:
+        description: "Force specific Go version (e.g., '1.25.0'). If empty, uses go.mod."
+        required: false
+        type: string
+        default: ""
     secrets:
       CLIENT_ID:
         description: "GitHub App ID"
@@ -50,6 +65,10 @@ on:
       GPG_PASSPHRASE:
         description: "GPG Private Key Passphrase"
         required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -228,7 +247,7 @@ jobs:
               echo -e "\e[35m[PROCESS] Cherry-picking commit: '$(git log -1 --format="%h - %s" $COMMIT)'\e[0m"
               if ! git cherry-pick --empty=drop $COMMIT; then
                 echo "::error::[ERROR] Merge conflict while applying your custom commit '$COMMIT'."
-                echo "::error::[ERROR] Manual intervention required. Your feature patch conflicts with the old stable branch code."
+                echo "::notice::To fix this, pull the upstream branch, rebase your feature branch 'origin/$FEATURE' locally, resolve conflicts, force push, and restart the release."
                 git cherry-pick --abort
                 exit 1
               fi
@@ -240,10 +259,9 @@ jobs:
 
           echo -e "\e[32m[SUCCESS] --- Feature Assembly Complete ---\e[0m"
 
-      - name: 🔖 Publish Release Branch & Tag
+      - name: 🔖 Publish Release Branch
         if: steps.check.outputs.should_release == 'true'
         env:
-          TARGET_TAG: ${{ steps.vars.outputs.tag }}
           RELEASE_BRANCH: ${{ inputs.release_branch }}
         run: |
           set -euo pipefail
@@ -254,6 +272,35 @@ jobs:
           echo "::endgroup::"
           echo -e "\e[32m[SUCCESS] Branch '$RELEASE_BRANCH' published.\e[0m"
 
+      - name: ⏳ Wait for Test Pipeline
+        if: steps.check.outputs.should_release == 'true' && inputs.wait_for_tests == true
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          WORKFLOW_FILE: ${{ inputs.test_workflow_name }}
+        run: |
+          set -euo pipefail
+          echo -e "\e[36m[ACTION] Waiting for workflow '$WORKFLOW_FILE' on branch '$RELEASE_BRANCH' to complete...\e[0m"
+
+          sleep 10
+
+          RUN_ID=$(gh run list --branch "$RELEASE_BRANCH" --workflow "$WORKFLOW_FILE" --limit 1 --json databaseId -q '.[0].databaseId')
+
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::[ERROR] Could not find a running test workflow for branch $RELEASE_BRANCH."
+            exit 1
+          fi
+
+          echo -e "\e[34m[INFO] Found workflow run ID: $RUN_ID. Watching status...\e[0m"
+          gh run watch "$RUN_ID" --exit-status
+          echo -e "\e[32m[SUCCESS] Tests passed successfully. Proceeding with tag and release.\e[0m"
+
+      - name: 🏷️ Publish Tag
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          TARGET_TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
           echo -e "\e[36m[ACTION] Tagging the assembled state as '$TARGET_TAG'...\e[0m"
           echo -e "\e[36m[ACTION] Force pushing tag '$TARGET_TAG' to origin...\e[0m"
           echo "::group::Git Tag & Push Logs"
@@ -266,7 +313,8 @@ jobs:
         if: steps.check.outputs.should_release == 'true'
         uses: actions/setup-go@v6
         with:
-          go-version-file: "go.mod"
+          go-version: ${{ inputs.go_version || '' }}
+          go-version-file: ${{ inputs.go_version == '' && 'go.mod' || '' }}
           cache: true
 
       - name: 📦 Download & Cache Go Modules
